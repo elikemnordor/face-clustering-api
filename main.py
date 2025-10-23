@@ -1,86 +1,122 @@
-from fastapi import FastAPI, UploadFile, File
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Float, Integer, JSON
+import os
+import io
+import numpy as np
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, Column, Integer, String, LargeBinary, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import numpy as np
-import insightface
-import io
+from insightface.app import FaceAnalysis
 from PIL import Image
-import json
-import os
+import uvicorn
 
-app = FastAPI(title="Face Embedding API")
+# ---------------------------------------
+# ✅ App & Database Setup
+# ---------------------------------------
+app = FastAPI(title="Face Clustering API")
 
-# -----------------------------
-# DATABASE SETUP
-# -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
+
 engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
+# ---------------------------------------
+# ✅ Database Model
+# ---------------------------------------
 class FaceEmbedding(Base):
     __tablename__ = "face_embeddings"
+
     id = Column(Integer, primary_key=True, index=True)
-    face_id = Column(String, unique=False)
-    embedding = Column(JSON)  # store as list
-    avg_similarity = Column(Float, default=0.0)
+    face_id = Column(String, index=True)
+    embedding = Column(LargeBinary)
+    image_url = Column(String)
+    similarity = Column(Float)
 
 Base.metadata.create_all(bind=engine)
 
-# -----------------------------
-# LOAD MODEL
-# -----------------------------
-model = insightface.app.FaceAnalysis(name="buffalo_l")
-model.prepare(ctx_id=0, det_size=(640, 640))
+# ---------------------------------------
+# ✅ Initialize Face Model
+# ---------------------------------------
+app_insight = FaceAnalysis(name="buffalo_l")
+app_insight.prepare(ctx_id=0, det_size=(640, 640))
 
-# -----------------------------
-# HELPERS
-# -----------------------------
+# ---------------------------------------
+# ✅ Utilities
+# ---------------------------------------
+def get_embedding(image: Image.Image):
+    arr = np.array(image)
+    faces = app_insight.get(arr)
+    if not faces:
+        return None
+    return faces[0].embedding.astype(np.float32)
+
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def get_embedding(image_bytes):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    faces = model.get(np.array(img))
-    if not faces:
-        return None
-    return faces[0].embedding.tolist()
+# ---------------------------------------
+# ✅ Routes
+# ---------------------------------------
 
-# -----------------------------
-# API ENDPOINT
-# -----------------------------
+@app.get("/")
+def home():
+    return {"message": "Face Clustering API is running"}
+
 @app.post("/process-face")
 async def process_face(file: UploadFile = File(...)):
-    db = SessionLocal()
-    content = await file.read()
-    new_embedding = get_embedding(content)
-    if new_embedding is None:
-        return {"error": "no face detected"}
+    try:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        embedding = get_embedding(image)
 
-    new_vec = np.array(new_embedding)
-    faces = db.query(FaceEmbedding).all()
+        if embedding is None:
+            return JSONResponse(content={"error": "No face detected"}, status_code=400)
 
-    best_match_id = None
-    best_score = 0.0
+        session = SessionLocal()
+        embeddings = session.query(FaceEmbedding).all()
 
-    for f in faces:
-        old_vec = np.array(f.embedding)
-        score = cosine_similarity(new_vec, old_vec)
-        if score > best_score:
-            best_score = score
-            best_match_id = f.face_id
+        # Compare to existing embeddings
+        best_match = None
+        best_score = 0.0
+        for e in embeddings:
+            existing_emb = np.frombuffer(e.embedding, dtype=np.float32)
+            sim = cosine_similarity(embedding, existing_emb)
+            if sim > best_score:
+                best_score = sim
+                best_match = e
 
-    threshold = 0.6  # tweak for stricter/looser matching
+        # Threshold for new face
+        THRESHOLD = 0.6
+        if best_match and best_score >= THRESHOLD:
+            face_id = best_match.face_id
+        else:
+            face_id = f"face_{len(embeddings)+1}"
 
-    if best_score < threshold or not best_match_id:
-        # new face
-        new_face_id = f"face_{len(faces)+1}"
-        db.add(FaceEmbedding(face_id=new_face_id, embedding=new_embedding))
-        db.commit()
-        db.close()
-        return {"face_id": new_face_id, "match": False, "similarity": best_score}
-    else:
-        db.close()
-        return {"face_id": best_match_id, "match": True, "similarity": best_score}
+        # Save new embedding
+        new_entry = FaceEmbedding(
+            face_id=face_id,
+            embedding=embedding.tobytes(),
+            image_url=file.filename,
+            similarity=best_score,
+        )
+        session.add(new_entry)
+        session.commit()
+        session.close()
+
+        return {
+            "face_id": face_id,
+            "similarity": float(best_score),
+            "message": "Processed successfully",
+        }
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# ---------------------------------------
+# ✅ Start Server (for local + Railway)
+# ---------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
