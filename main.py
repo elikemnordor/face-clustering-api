@@ -150,7 +150,7 @@ async def process_face(file: UploadFile = File(...)):
             face_id=face_id,
             embedding=embedding.tobytes(),
             image_url=file.filename,
-            similarity=best_score,
+            similarity=float(best_score),
         )
         session.add(new_entry)
         session.commit()
@@ -186,4 +186,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting server on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
 
