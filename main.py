@@ -65,7 +65,7 @@ Base.metadata.create_all(bind=engine)
 try:
     logger.info("Initializing FaceAnalysis model (buffalo_l)...")
     app_insight = FaceAnalysis(name="buffalo_l")
-    app_insight.prepare(ctx_id=0, det_size=(640, 640))
+    app_insight.prepare(ctx_id=-1, det_size=(640, 640))  # use CPU
     logger.info("✅ Face model loaded successfully.")
 except Exception as e:
     logger.error(f"❌ Face model failed to load: {e}")
@@ -186,3 +186,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting server on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
